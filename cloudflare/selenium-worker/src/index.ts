@@ -142,15 +142,23 @@ export default {
           endpoints: {
             health: "GET /health",
             run: "POST /run",
+            browse: "POST /browse",
             runWithId: "POST /jobs/:jobId/run",
             jobHealth: "GET /jobs/:jobId/health",
             artifact: "GET /jobs/:jobId/artifacts/:filename",
           },
-          example: {
-            curl: [
-              "curl -X POST http://localhost:8787/run \\",
+          examples: {
+            run_test: [
+              "curl -X POST <worker>/run \\",
               "  -H 'Content-Type: application/json' \\",
               "  -d '{\"test\":\"examples/my_first_test.py\"}'",
+            ].join("\n"),
+            browse: [
+              "curl -X POST <worker>/browse \\",
+              "  -H 'Content-Type: application/json' \\",
+              '  -d \'{"url":"https://example.com",',
+              '       "extract":["h1","p"],',
+              '       "screenshot":true}\'',
             ].join("\n"),
           },
         });
@@ -165,6 +173,22 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/run") {
         return runJob(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/browse") {
+        const payload = await parseJson<Record<string, unknown>>(
+          request,
+        );
+        const browseJobId = `browse-${Date.now()}`;
+        const container =
+          env.SELENIUMBASE_RUNNER.getByName(browseJobId);
+        await container.startAndWaitForPorts();
+        const upstream = buildContainerRequest(request, "/browse", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        return container.fetch(upstream);
       }
 
       if (segments.length >= 2 && segments[0] === "jobs") {

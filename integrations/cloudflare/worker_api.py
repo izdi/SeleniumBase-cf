@@ -13,6 +13,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 
+import base64
+import re
+
 BASE_DIR = Path("/SeleniumBase").resolve()
 PORT = int(os.environ.get("SELENIUMBASE_API_PORT", "8000"))
 RESULTS_ROOT = Path(
@@ -20,6 +23,7 @@ RESULTS_ROOT = Path(
 ).resolve()
 DEFAULT_TEST = "examples/my_first_test.py"
 MAX_TIMEOUT_SECONDS = 3600
+MAX_BROWSE_TIMEOUT = 120
 LOG_TAIL_BYTES = 4000
 SAFE_ID_CHARS = set(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
@@ -212,6 +216,251 @@ def _run_job(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     return response, status_code
 
 
+URL_PATTERN = re.compile(
+    r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE
+)
+
+ALLOWED_ACTIONS = {
+    "click", "type", "wait", "get_text", "get_attribute",
+    "screenshot", "select", "scroll_to", "execute_script",
+}
+
+
+def _validate_url(url: Any) -> str:
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError('"url" must be a non-empty string')
+    url = url.strip()
+    if not URL_PATTERN.match(url):
+        raise ValueError('"url" must be a valid http/https URL')
+    return url
+
+
+def _validate_actions(raw_actions: Any) -> list[dict[str, Any]]:
+    if raw_actions is None:
+        return []
+    if not isinstance(raw_actions, list):
+        raise ValueError('"actions" must be a list')
+    validated = []
+    for i, action in enumerate(raw_actions):
+        if not isinstance(action, dict):
+            raise ValueError(f'actions[{i}] must be an object')
+        cmd = action.get("action")
+        if cmd not in ALLOWED_ACTIONS:
+            raise ValueError(
+                f'actions[{i}].action must be one of: '
+                f'{", ".join(sorted(ALLOWED_ACTIONS))}'
+            )
+        validated.append(action)
+    return validated
+
+
+def _browse(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    url = _validate_url(payload.get("url"))
+    actions = _validate_actions(payload.get("actions"))
+    timeout = _coerce_timeout_seconds(
+        payload.get("timeout_seconds") or 60
+    )
+    if timeout > MAX_BROWSE_TIMEOUT:
+        timeout = MAX_BROWSE_TIMEOUT
+    extract_html = bool(payload.get("html", False))
+    extract_text = bool(payload.get("text", True))
+    take_screenshot = bool(payload.get("screenshot", True))
+    selectors = payload.get("extract", [])
+    if not isinstance(selectors, list):
+        raise ValueError('"extract" must be a list of CSS selectors')
+
+    job_id = f"browse-{int(time.time() * 1000)}"
+    job_dir = RESULTS_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_path = job_dir / "screenshot.png"
+
+    script = _build_browse_script(
+        url=url,
+        actions=actions,
+        extract_html=extract_html,
+        extract_text=extract_text,
+        take_screenshot=take_screenshot,
+        screenshot_path=str(screenshot_path),
+        selectors=selectors,
+        result_path=str(job_dir / "result.json"),
+    )
+    script_path = job_dir / "browse_task.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    start_time = time.time()
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            ["python3", str(script_path)],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        return_code = completed.returncode
+        stderr_text = completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        return_code = 124
+        stderr_text = _tail_text(exc.stderr)
+
+    duration = round(time.time() - start_time, 3)
+
+    result_file = job_dir / "result.json"
+    browse_result: dict[str, Any] = {}
+    if result_file.is_file():
+        try:
+            browse_result = json.loads(
+                result_file.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError:
+            pass
+
+    screenshot_b64 = None
+    if take_screenshot and screenshot_path.is_file():
+        screenshot_b64 = base64.b64encode(
+            screenshot_path.read_bytes()
+        ).decode("ascii")
+
+    response: dict[str, Any] = {
+        "ok": return_code == 0 and not timed_out,
+        "job_id": job_id,
+        "url": url,
+        "duration_seconds": duration,
+        "timed_out": timed_out,
+    }
+    if browse_result.get("title"):
+        response["title"] = browse_result["title"]
+    if browse_result.get("text"):
+        response["page_text"] = browse_result["text"][:8000]
+    if browse_result.get("html"):
+        response["page_html"] = browse_result["html"][:50000]
+    if browse_result.get("extracted"):
+        response["extracted"] = browse_result["extracted"]
+    if browse_result.get("action_results"):
+        response["action_results"] = browse_result["action_results"]
+    if screenshot_b64:
+        response["screenshot_base64"] = screenshot_b64
+    if return_code != 0:
+        response["error"] = stderr_text[-2000:] if stderr_text else ""
+    response["artifacts"] = {
+        "screenshot": f"/artifacts/{job_id}/screenshot.png",
+        "result": f"/artifacts/{job_id}/result.json",
+    }
+
+    status = HTTPStatus.OK if response["ok"] else (
+        HTTPStatus.GATEWAY_TIMEOUT if timed_out
+        else HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+    return response, status
+
+
+def _build_browse_script(
+    *,
+    url: str,
+    actions: list[dict[str, Any]],
+    extract_html: bool,
+    extract_text: bool,
+    take_screenshot: bool,
+    screenshot_path: str,
+    selectors: list[Any],
+    result_path: str,
+) -> str:
+    actions_json = json.dumps(actions)
+    selectors_json = json.dumps(selectors)
+    return f'''#!/usr/bin/env python3
+"""Auto-generated browse task."""
+import json
+from seleniumbase import SB
+
+url = {url!r}
+actions = json.loads({actions_json!r})
+selectors = json.loads({selectors_json!r})
+result = {{"title": "", "text": "", "html": "", "extracted": {{}}}}
+result["action_results"] = []
+
+with SB(uc=True, headless=True, test=True) as sb:
+    sb.open(url)
+    sb.sleep(1)
+
+    for act in actions:
+        cmd = act["action"]
+        sel = act.get("selector", "")
+        val = act.get("value", "")
+        act_result = {{"action": cmd, "selector": sel}}
+        try:
+            if cmd == "click":
+                sb.click(sel)
+            elif cmd == "type":
+                sb.type(sel, val)
+            elif cmd == "wait":
+                sb.sleep(float(val) if val else 2)
+            elif cmd == "get_text":
+                act_result["value"] = sb.get_text(sel)
+            elif cmd == "get_attribute":
+                attr = act.get("attribute", "href")
+                act_result["value"] = sb.get_attribute(sel, attr)
+            elif cmd == "screenshot":
+                pass  # handled below
+            elif cmd == "select":
+                sb.select_option_by_text(sel, val)
+            elif cmd == "scroll_to":
+                sb.scroll_to(sel)
+            elif cmd == "execute_script":
+                act_result["value"] = sb.execute_script(val)
+            act_result["ok"] = True
+        except Exception as e:
+            act_result["ok"] = False
+            act_result["error"] = str(e)
+        result["action_results"].append(act_result)
+
+    result["title"] = sb.get_title()
+    if {extract_text!r}:
+        result["text"] = sb.get_text("body")[:8000]
+    if {extract_html!r}:
+        result["html"] = sb.get_page_source()[:50000]
+    if {take_screenshot!r}:
+        try:
+            import base64 as _b64
+            _metrics = sb.execute_cdp_cmd(
+                "Page.getLayoutMetrics", {{}}
+            )
+            _cw = _metrics["contentSize"]["width"]
+            _ch = _metrics["contentSize"]["height"]
+            sb.execute_cdp_cmd(
+                "Emulation.setDeviceMetricsOverride",
+                {{
+                    "mobile": False,
+                    "width": _cw,
+                    "height": _ch,
+                    "deviceScaleFactor": 1,
+                }},
+            )
+            _clip = {{
+                "x": 0, "y": 0,
+                "width": _cw, "height": _ch, "scale": 1,
+            }}
+            _shot = sb.execute_cdp_cmd(
+                "Page.captureScreenshot",
+                {{"format": "png", "clip": _clip, "captureBeyondViewport": True}},
+            )
+            with open({screenshot_path!r}, "wb") as _f:
+                _f.write(_b64.b64decode(_shot["data"]))
+        except Exception:
+            sb.save_screenshot({screenshot_path!r})
+
+    for sel in selectors:
+        try:
+            result["extracted"][sel] = sb.get_text(sel)
+        except Exception:
+            result["extracted"][sel] = None
+
+    with open({result_path!r}, "w") as f:
+        json.dump(result, f)
+'''
+
+
 class SeleniumBaseRequestHandler(BaseHTTPRequestHandler):
     server_version = "SeleniumBaseCloudflare/0.1"
 
@@ -258,6 +507,7 @@ class SeleniumBaseRequestHandler(BaseHTTPRequestHandler):
                     "routes": {
                         "health": "GET /health",
                         "run": "POST /run",
+                        "browse": "POST /browse",
                         "artifacts": "GET /artifacts/<job_id>/<filename>",
                     },
                 },
@@ -305,19 +555,30 @@ class SeleniumBaseRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/run":
-            self._send_json(HTTPStatus.NOT_FOUND, _error_payload("route not found"))
+
+        if parsed.path == "/run":
+            handler_fn = _run_job
+        elif parsed.path == "/browse":
+            handler_fn = _browse
+        else:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, _error_payload("route not found")
+            )
             return
 
         try:
             payload = _read_request_json(self)
-            response, status = _run_job(payload)
+            response, status = handler_fn(payload)
             self._send_json(status, response)
         except FileNotFoundError as exc:
-            self._send_json(HTTPStatus.NOT_FOUND, _error_payload(str(exc)))
+            self._send_json(
+                HTTPStatus.NOT_FOUND, _error_payload(str(exc))
+            )
         except ValueError as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, _error_payload(str(exc)))
-        except Exception as exc:  # pragma: no cover - defensive handler
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, _error_payload(str(exc))
+            )
+        except Exception as exc:
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 _error_payload(
