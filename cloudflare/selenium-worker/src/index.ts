@@ -28,7 +28,7 @@ const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 export class SeleniumBaseContainer extends Container {
   defaultPort = 8000;
-  sleepAfter = "10m";
+  sleepAfter = "2m";
   enableInternet = true;
   entrypoint = ["/SeleniumBase/integrations/cloudflare/entrypoint.sh"];
   envVars = {
