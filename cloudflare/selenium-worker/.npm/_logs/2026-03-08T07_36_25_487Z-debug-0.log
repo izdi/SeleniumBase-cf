@@ -1,0 +1,18 @@
+0 verbose cli /Users/izdi/.nvm/versions/node/v22.14.0/bin/node /opt/homebrew/bin/npm
+1 info using npm@11.7.0
+2 info using node@v22.14.0
+3 silly config load:file:/opt/homebrew/lib/node_modules/npm/npmrc
+4 silly config load:file:/Users/izdi/Projects/SeleniumBase/cloudflare/selenium-worker/.npmrc
+5 silly config load:file:/opt/homebrew/etc/npmrc
+6 verbose title npm run types
+7 verbose argv "run" "types"
+8 verbose logfile logs-max:10 dir:/Users/izdi/Projects/SeleniumBase/cloudflare/selenium-worker/.npm/_logs/2026-03-08T07_36_25_487Z-
+9 verbose logfile /Users/izdi/Projects/SeleniumBase/cloudflare/selenium-worker/.npm/_logs/2026-03-08T07_36_25_487Z-debug-0.log
+10 silly logfile done cleaning log files
+11 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with ENOTFOUND
+12 verbose cwd /Users/izdi/Projects/SeleniumBase/cloudflare/selenium-worker
+13 verbose os Darwin 25.3.0
+14 verbose node v22.14.0
+15 verbose npm  v11.7.0
+16 verbose exit 1
+17 verbose code 1

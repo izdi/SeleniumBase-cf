@@ -145,11 +145,15 @@ RUN seleniumbase get chromedriver --path
 ENV DISPLAY=":99"
 RUN Xvfb :99 -screen 1 1920x1080x16 -nolisten tcp &
 
+# Needed for Cloudflare Containers local development via "wrangler dev".
+EXPOSE 8000
+
 #==========================================
 # Create entrypoint and grab example tests
 #==========================================
 COPY integrations/docker/docker-entrypoint.sh /
 COPY integrations/docker/run_docker_test_in_chrome.sh /
 RUN chmod +x *.sh
+RUN chmod +x /SeleniumBase/integrations/cloudflare/entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["/bin/bash"]
